@@ -1,0 +1,10 @@
+# Patient data exports and local settings must never be committed
+*.xlsx
+*.xls
+*.csv
+chair_map.json
+.streamlit/secrets.toml
+
+__pycache__/
+*.pyc
+.venv/

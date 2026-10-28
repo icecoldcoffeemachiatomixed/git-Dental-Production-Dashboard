@@ -8,6 +8,7 @@ columns are dropped or one-way hashed immediately after load and are never displ
 import hashlib
 import io
 import json
+import os
 import re
 import secrets
 from pathlib import Path
@@ -19,7 +20,10 @@ import streamlit as st
 
 st.set_page_config(page_title="Dental Production Dashboard", page_icon="🦷", layout="wide")
 
-DEFAULT_PATH = r"C:\Users\christian Mar\Downloads\Production.xlsx"
+# Local mode (set by run_dashboard.bat) allows reading files from disk and saving the chair map.
+# Hosted deployments leave it unset: uploads only, nothing written to the shared server disk.
+LOCAL_MODE = os.environ.get("DENTAL_DASHBOARD_LOCAL") == "1"
+DEFAULT_PATH = str(Path.home() / "Downloads" / "Production.xlsx")
 CHAIR_MAP_FILE = Path(__file__).with_name("chair_map.json")
 REDACTED = "[PATIENT_ID_REDACTED]"
 
@@ -194,6 +198,8 @@ def peak_concurrency(visits: pd.DataFrame) -> int:
 
 def occupancy_grid(visits: pd.DataFrame) -> pd.DataFrame:
     """Average chairs in use, by weekday × hour (booked minutes / 60 / days of that weekday)."""
+    if "start" not in visits.columns:
+        return pd.DataFrame()
     v = visits[(visits["minutes"] > 0) & visits["start"].notna()]
     if v.empty:
         return pd.DataFrame()
@@ -291,15 +297,18 @@ if "salt" not in st.session_state:
 with st.sidebar:
     st.header("Data source")
     upload = st.file_uploader("Upload production export", type=["xlsx", "xls"])
-    path = st.text_input("…or file path", DEFAULT_PATH)
+    path = st.text_input("…or file path", DEFAULT_PATH) if LOCAL_MODE else None
     currency = st.text_input("Currency label", "AED")
     st.caption("Patient names, chart numbers, member/policy IDs and authorizations are "
                "removed or one-way hashed on load and never displayed.")
 
+if not upload and not path:
+    st.info("Upload a production export in the sidebar to begin.")
+    st.stop()
 try:
     data = upload.getvalue() if upload else Path(path).read_bytes()
     df_all = load_clean(data, st.session_state.salt)
-except FileNotFoundError:
+except (FileNotFoundError, IsADirectoryError, PermissionError):
     st.info("Upload a production export or enter a valid file path in the sidebar.")
     st.stop()
 except Exception as exc:
@@ -309,6 +318,7 @@ except Exception as exc:
 money = lambda v: f"{currency} {v:,.0f}"
 money_short = lambda v: f"{v / 1e6:.2f}M" if abs(v) >= 1e6 else f"{v / 1e3:.1f}k" if abs(v) >= 1e3 else f"{v:.0f}"
 HOVER_MONEY = f"{currency} %{{x:,.0f}}"
+NO_TIMES = "Needs Start Time / End Time columns in the export."
 
 # ---- chair source: real operatory column if present, else editable provider→chair map
 providers_all = sorted(df_all["provider"].unique())
@@ -316,25 +326,44 @@ has_operatory = df_all["operatory"].notna().any() and (df_all["operatory"].str.l
 if has_operatory:
     df_all["chair"] = df_all["operatory"]
 else:
-    saved = json.loads(CHAIR_MAP_FILE.read_text()) if CHAIR_MAP_FILE.exists() else {}
-    chair_map = {p: saved.get(p, f"Op · {p}") for p in providers_all}
-    with st.sidebar.expander("Chair assignment", expanded=not saved):
+    with st.sidebar.expander("Chair assignment", expanded=True):
         st.caption("This export has no operatory column. Assign each provider to the chair they "
                    "work in; providers sharing a chair can use the same name.")
+        # Hosted: the map lives in this browser session only; download it to reuse next time.
+        map_upload = None if LOCAL_MODE else st.file_uploader("Load saved chair map", type=["json"])
+        try:
+            if map_upload:
+                saved = json.loads(map_upload.getvalue())
+            elif LOCAL_MODE and CHAIR_MAP_FILE.exists():
+                saved = json.loads(CHAIR_MAP_FILE.read_text())
+            else:
+                saved = {}
+            saved = saved if isinstance(saved, dict) else {}
+        except ValueError:
+            st.warning("That chair map file could not be read.")
+            saved = {}
+        chair_map = {p: str(saved.get(p, f"Op · {p}")) for p in providers_all}
         edited = st.data_editor(
             pd.DataFrame({"Provider": list(chair_map), "Chair": list(chair_map.values())}),
-            hide_index=True, disabled=["Provider"], width="stretch", key="chair_editor",
+            hide_index=True, disabled=["Provider"], width="stretch",
+            key=f"chair_editor_{map_upload.file_id if map_upload else 'base'}",
         )
         chair_map = dict(zip(edited["Provider"], edited["Chair"].fillna("").replace("", "Unassigned")))
-        if st.button("Save chair map"):
-            CHAIR_MAP_FILE.write_text(json.dumps(chair_map, indent=2))
+        map_json = json.dumps(chair_map, indent=2)
+        if LOCAL_MODE and st.button("Save chair map"):
+            CHAIR_MAP_FILE.write_text(map_json)
             st.success("Saved.")
+        st.download_button("Download chair map", map_json, file_name="chair_map.json", mime="application/json")
     df_all["chair"] = df_all["provider"].map(chair_map)
 
 visits_all = build_visits(df_all)
 inferred_chairs = peak_concurrency(visits_all)
-open_from = int(visits_all["start"].dt.hour.min()) if "start" in visits_all else 8
-open_to = int(min(24, visits_all["end"].dt.hour.max() + 1)) if "end" in visits_all else 18
+start_h = visits_all["start"].dt.hour if "start" in visits_all else pd.Series(dtype=float)
+end_h = visits_all["end"].dt.hour if "end" in visits_all else pd.Series(dtype=float)
+open_from = int(start_h.min()) if start_h.notna().any() else 8
+open_to = int(min(24, end_h.max() + 1)) if end_h.notna().any() else 18
+if open_to <= open_from:
+    open_from, open_to = 8, 18
 
 with st.sidebar:
     st.header("Operations")
@@ -409,11 +438,16 @@ with tab_chairs:
         st.plotly_chart(hbar(chair_t["Net production"], HOVER_MONEY, money_short), width="stretch")
     with c2:
         st.subheader("Net per booked chair hour")
-        st.plotly_chart(hbar(chair_t["Net / booked hour"].dropna(), HOVER_MONEY + " / hr", money_short),
-                        width="stretch")
+        per_hr = chair_t["Net / booked hour"].dropna()
+        if per_hr.empty:
+            st.caption(NO_TIMES)
+        else:
+            st.plotly_chart(hbar(per_hr, HOVER_MONEY + " / hr", money_short), width="stretch")
     st.subheader("Average chairs in use, by weekday and hour")
     grid = occupancy_grid(visits)
-    if not grid.empty:
+    if grid.empty:
+        st.caption(NO_TIMES)
+    else:
         st.plotly_chart(heatmap(grid, "%{y} %{x}:00<br>%{z:.1f} chairs in use"), width="stretch")
         st.caption(f"Peak simultaneous appointments in this selection: {peak_concurrency(visits)} "
                    f"· overall utilization {visits['minutes'].sum() / (chairs * op_days * open_minutes):.0%} "
@@ -435,8 +469,11 @@ with tab_prov:
         st.plotly_chart(hbar(prov_t["Daily avg (net)"], HOVER_MONEY + " / day", money_short), width="stretch")
     with c2:
         st.subheader("Net per chair hour")
-        st.plotly_chart(hbar(prov_t["Net / chair hour"].dropna(), HOVER_MONEY + " / hr", money_short),
-                        width="stretch")
+        per_hr = prov_t["Net / chair hour"].dropna()
+        if per_hr.empty:
+            st.caption(NO_TIMES)
+        else:
+            st.plotly_chart(hbar(per_hr, HOVER_MONEY + " / hr", money_short), width="stretch")
     daily = df.groupby("date")["net"].sum()
     st.subheader("Daily net production")
     fig = go.Figure(go.Scatter(x=daily.index, y=daily.values, mode="lines+markers",
